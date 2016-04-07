@@ -74,11 +74,12 @@ class ProxyHandler(WSGIHandler):
             self.__dict__.pop('socket', None)
             self.__dict__.pop('rfile', None)
     
-    """ override WSGIHandler.get_environ() to pass raw headers to environ
+    """ override WSGIHandler.get_environ() to pass raw headers and raw path to environ
     """
     def get_environ(self):
         env = super(ProxyHandler, self).get_environ()
         env['__ghttproxy.rawheaders'] = self.headers.headers
+        env['PATH_INFO'] = self.path.split('?', 1)[0]
         return env
 
 # some of below code are copied and modifed from "meek/wsgi/reflect.py" 

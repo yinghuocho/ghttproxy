@@ -59,8 +59,8 @@ class ProxyHandler(WSGIHandler):
                 break
             
             if self.socket and hasattr(self, 'command') and \
-                        self.command == "CONNECT" and self.environ.get('TUNNEL_CONN', None):
-                pipe_socket(self.socket, self.environ.get('TUNNEL_CONN'))
+                        self.command == "CONNECT" and self.environ.get('__ghttproxy.tunnelconn', None):
+                pipe_socket(self.socket, self.environ.get('__ghttproxy.tunnelconn'))
         finally:
             if self.socket is not None:
                 try:
@@ -73,6 +73,13 @@ class ProxyHandler(WSGIHandler):
                     pass
             self.__dict__.pop('socket', None)
             self.__dict__.pop('rfile', None)
+    
+    """ override WSGIHandler.get_environ() to pass raw headers to environ
+    """
+    def get_environ(self):
+        env = super(ProxyHandler, self).get_environ()
+        env['__ghttproxy.rawheaders'] = self.headers.headers
+        return env
 
 # some of below code are copied and modifed from "meek/wsgi/reflect.py" 
 # at https://git.torproject.org/pluggable-transports/meek.git
@@ -101,53 +108,61 @@ def set_forwarded_for(environ, headers):
             'X-Forwarded-For' not in headers:
         # don't add header if we are forwarding localhost, 
         return
-    ips = headers.get('X-Forwarded-For', '').split(", ")
-    ips.append(environ['REMOTE_ADDR'])
-    headers['X-Forwarded-For'] = ", ".join(ips)
+    
+    s = headers.get('X-Forwarded-For', '')
+    if s:
+        forwarders = s.split(", ")
+    else:
+        forwarders = []
+    addr = environ['REMOTE_ADDR']
+    if addr:
+        forwarders.append(addr)
+    if forwarders:
+        headers['X-Forwarded-For'] = ", ".join(forwarders)    
 
 def reconstruct_url(environ):
-    host = environ.get('HTTP_HOST', '')
-    scriptname = environ.get('SCRIPT_NAME', '')
-    pathinfo = environ.get('PATH_INFO', '')
-    if pathinfo.startswith("http://"):
-        url = pathinfo
-    elif host:    
-        url = 'http://' + host
-        url += scriptname
-        url += pathinfo
+    path = environ.get('PATH_INFO')
+    if path.startswith("http://"):
+        url = path
     else:
-        url = "http://" + pathinfo
+        host = environ.get('HTTP_HOST')    
+        url = 'http://' + host + path
         
-    if environ.get('QUERY_STRING', ''):
-        url += '?' + environ['QUERY_STRING']
+    query = environ.get('QUERY_STRING', '') 
+    if query:
+        url += '?' + query
     return url
 
 def get_destination(environ):
-    http_host = environ.get('HTTP_HOST', '').lower()
-    http_host_split = http_host.split(":")
-    path_info = environ.get('PATH_INFO', '').lower()
-    if path_info.startswith("http"):
-        path_info = urlparse.urlparse(path_info).netloc
-    path_info_split = path_info.split(":")
-    
-    if len(http_host_split) == 2:
-        return http_host_split[0], int(http_host_split[1])
-    if len(path_info_split) == 2:
-        return path_info_split[0], int(path_info_split[1])
-    
-    # no explicit port, if CONNECT cmd, then prefer 443, else 80 
     if environ["REQUEST_METHOD"] == "CONNECT":
         port = 443
     else:
         port = 80
-    if http_host:
-        host = http_host
+    
+    host = environ.get('HTTP_HOST', '').lower().split(":")
+    path = environ.get('PATH_INFO', '').lower()
+    req = urlparse.urlparse(path)
+    # first process requeset line
+    if req.scheme:
+        if req.scheme != "http":
+            raise Exception('invalid scheme in request line')
+        netloc = req.netloc.split(":")
+        if len(netloc) == 2:
+            return netloc[0], int(netloc[1])
+        else:
+            return req.netloc, port
+    elif req.netloc:
+        raise Exception('invalid scheme in request line')
+    
+    # then process host
+    if len(host) == 2:
+        return host[0], int(host[1])
     else:
-        host = path_info
-    return host, port
+        return host[0], port
 
-BLACKLIST_HEADERS = (
-    'HTTP_PROXY_CONNECTION',
+NON_FORWARD_HEADERS = (
+    'proxy-connection',
+    'host', 
 )
 
 def copy_request(environ):
@@ -158,16 +173,17 @@ def copy_request(environ):
     content_length = environ.get("CONTENT_LENGTH")
     if content_length:
         body = LimitedReader(environ["wsgi.input"], int(content_length))
-        headers.append(("Content-Length", content_length))
     else:
         body = ""
         
-    for (name, value) in environ.iteritems():
-        if name in BLACKLIST_HEADERS:
+    raw = environ['__ghttproxy.rawheaders']
+    for header in raw:
+        key, value = header.split(':', 1)
+        if not key:
             continue
-        
-        if name.startswith("HTTP_") and value is not None:
-            headers.append((name[5:].replace("_", "-").lower(), value))
+        if key.strip().lower() in NON_FORWARD_HEADERS:
+            continue
+        headers.append((key.strip(), value.strip()))
     headers.append(("Connection", "Keep-Alive"))
     headers = dict(headers)
     return method, url, body, headers
@@ -194,6 +210,7 @@ class ProxyApplication(object):
             conn.sock = http_conn
             u = urlparse.urlsplit(url)
             path = urlparse.urlunsplit(("", "", u.path, u.query, ""))
+            # Host header put by conn.request
             conn.request(method, path, body, headers)
             resp = conn.getresponse()
             start_response("%d %s" % (resp.status, resp.reason), resp.getheaders())
@@ -220,7 +237,7 @@ class ProxyApplication(object):
         
         try:
             tunnel_conn = socket.create_connection((host, port), timeout=self.timeout)
-            environ['TUNNEL_CONN'] = tunnel_conn
+            environ['__ghttproxy.tunnelconn'] = tunnel_conn
             start_response("200 Connection established", [])
             return []
         except socket.timeout:  # @UndefinedVariable
@@ -263,7 +280,7 @@ if __name__ == '__main__':
     logging.basicConfig(
         format='[%(asctime)s][%(name)s][%(levelname)s] - %(message)s',
         datefmt='%Y-%d-%m %H:%M:%S',
-        level=logging.DEBUG, 
+        level=logging.DEBUG,
     )
     HTTPProxyServer("127.0.0.1", 8000, ProxyApplication()).run()
 
